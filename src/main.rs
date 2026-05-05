@@ -1,0 +1,551 @@
+use anyhow::{bail, Context, Result};
+use base64::Engine;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+const CONFIG_DIR: &str = ".config/ctc";
+const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+
+fn config_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    Path::new(&home).join(CONFIG_DIR)
+}
+
+fn config_file(name: &str) -> PathBuf {
+    config_dir().join(name)
+}
+
+fn ensure_config_dir() -> Result<()> {
+    let dir = config_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating config dir {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn load_api_key() -> Result<String> {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
+    let path = config_file("api_key");
+    if path.exists() {
+        let key = fs::read_to_string(&path)
+            .with_context(|| format!("reading config {}", path.display()))?
+            .trim()
+            .to_string();
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
+    bail!(
+        "API key not found. Run `ctc init` to set up, or set ANTHROPIC_API_KEY environment variable."
+    )
+}
+
+fn load_default_model() -> String {
+    let path = config_file("model");
+    if path.exists() {
+        if let Ok(model) = fs::read_to_string(&path) {
+            let model = model.trim().to_string();
+            if !model.is_empty() {
+                return model;
+            }
+        }
+    }
+    DEFAULT_MODEL.to_string()
+}
+
+fn save_default_model(model: &str) -> Result<()> {
+    ensure_config_dir()?;
+    let path = config_file("model");
+    fs::write(&path, model).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn run_init() -> Result<()> {
+    println!("🔑 Claude Token Counter — Setup\n");
+
+    let path = config_file("api_key");
+    if path.exists() {
+        let existing = fs::read_to_string(&path)?.trim().to_string();
+        if !existing.is_empty() {
+            let masked = format!(
+                "{}...{}",
+                &existing[..8.min(existing.len())],
+                &existing[existing.len().saturating_sub(4)..]
+            );
+            println!("Found existing API key: {masked}");
+            print!("Overwrite? [y/N] ");
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("Kept existing key.");
+                return Ok(());
+            }
+        }
+    }
+
+    print!("Enter your Anthropic API key: ");
+    io::stdout().flush()?;
+    let mut key = String::new();
+    io::stdin().read_line(&mut key)?;
+    let key = key.trim();
+
+    if key.is_empty() {
+        bail!("API key cannot be empty.");
+    }
+
+    ensure_config_dir()?;
+    fs::write(&path, key).with_context(|| format!("writing config {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    println!("\n✅ API key saved to {}", path.display());
+    println!("   (file permissions set to 600 — only you can read it)");
+    println!("\nYou're all set! Try: ctc <file>");
+    Ok(())
+}
+
+async fn fetch_models(client: &reqwest::Client, api_key: &str) -> Result<Vec<ModelInfo>> {
+    let mut all_models = Vec::new();
+    let mut after_id: Option<String> = None;
+
+    loop {
+        let mut url = "https://api.anthropic.com/v1/models?limit=100".to_string();
+        if let Some(ref cursor) = after_id {
+            url.push_str(&format!("&after_id={cursor}"));
+        }
+
+        let response = client
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .context("fetching models from Anthropic API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            if let Ok(err) = response.json::<ApiError>().await {
+                bail!("API error ({}): {}", status, err.error.message);
+            }
+            bail!("API error: {}", status);
+        }
+
+        let page: ModelsResponse = response.json().await.context("parsing models response")?;
+        all_models.extend(page.data);
+
+        if page.has_more {
+            after_id = page.last_id;
+        } else {
+            break;
+        }
+    }
+
+    Ok(all_models)
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+async fn run_model() -> Result<()> {
+    let api_key = load_api_key()?;
+    let client = reqwest::Client::new();
+    let current = load_default_model();
+
+    println!("Fetching models from Anthropic API...\n");
+    let models = fetch_models(&client, &api_key).await?;
+
+    if models.is_empty() {
+        bail!("No models returned from API.");
+    }
+
+    println!("Current default: {current}\n");
+    println!("Available models:");
+
+    for (i, m) in models.iter().enumerate() {
+        let marker = if m.id == current { " ←" } else { "" };
+        let ctx = format_tokens(m.max_input_tokens);
+        println!(
+            "  {:>2}) {:<40} {} ({}){marker}",
+            i + 1,
+            m.id,
+            m.display_name,
+            ctx
+        );
+    }
+
+    println!(
+        "\nEnter number [1-{}] or a custom model name (empty to cancel):",
+        models.len()
+    );
+    print!("> ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        println!("No changes.");
+        return Ok(());
+    }
+
+    let selected = if let Ok(n) = input.parse::<usize>() {
+        if n >= 1 && n <= models.len() {
+            models[n - 1].id.clone()
+        } else {
+            bail!("Invalid selection: {n}");
+        }
+    } else {
+        input.to_string()
+    };
+
+    save_default_model(&selected)?;
+    println!("\n✅ Default model set to: {selected}");
+    Ok(())
+}
+
+// --- CLI ---
+
+#[derive(Parser)]
+#[command(
+    name = "ctc",
+    about = "Claude Token Counter — count tokens in files using Claude's API",
+    version,
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    count: CountArgs,
+}
+
+#[derive(Args)]
+struct CountArgs {
+    /// File paths to count tokens for
+    files: Vec<PathBuf>,
+
+    /// Claude model to use (overrides default)
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// System prompt to include in token count
+    #[arg(short, long)]
+    system: Option<String>,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+}
+
+#[derive(Clone, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+    Csv,
+}
+
+#[derive(Serialize)]
+struct FileResult {
+    file: String,
+    tokens: u64,
+}
+
+#[derive(Serialize)]
+struct JsonOutput {
+    model: String,
+    files: Vec<FileResult>,
+    total_tokens: u64,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Set up your Anthropic API key
+    Init,
+    /// List available models and set the default
+    Model,
+}
+
+// --- API types ---
+
+#[derive(Serialize)]
+struct CountTokensRequest {
+    model: String,
+    messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Message {
+    role: String,
+    content: Content,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Content {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+    #[serde(rename = "document")]
+    Document { source: DocumentSource },
+}
+
+#[derive(Serialize)]
+struct ImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct DocumentSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct CountTokensResponse {
+    input_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct ApiError {
+    error: ApiErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorDetail {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+    has_more: bool,
+    #[serde(default)]
+    last_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelInfo {
+    id: String,
+    display_name: String,
+    max_input_tokens: u64,
+}
+
+// --- File handling ---
+
+fn image_media_type(ext: &str) -> Option<&'static str> {
+    match ext {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn build_content(path: &Path) -> Result<Content> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+
+    if ext == "pdf" {
+        let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        return Ok(Content::Blocks(vec![
+            ContentBlock::Document {
+                source: DocumentSource {
+                    source_type: "base64".into(),
+                    media_type: "application/pdf".into(),
+                    data: encoded,
+                },
+            },
+            ContentBlock::Text {
+                text: format!("File: {filename}"),
+            },
+        ]));
+    }
+
+    if let Some(media_type) = image_media_type(&ext) {
+        let data = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        return Ok(Content::Blocks(vec![
+            ContentBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".into(),
+                    media_type: media_type.into(),
+                    data: encoded,
+                },
+            },
+            ContentBlock::Text {
+                text: format!("File: {filename}"),
+            },
+        ]));
+    }
+
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Content::Text(text))
+}
+
+async fn count_tokens(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    system: Option<&str>,
+    path: &Path,
+) -> Result<u64> {
+    let content = build_content(path)?;
+
+    let request = CountTokensRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: "user".into(),
+            content,
+        }],
+        system: system.map(String::from),
+    };
+
+    let response = client
+        .post("https://api.anthropic.com/v1/messages/count_tokens")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&request)
+        .send()
+        .await
+        .context("sending request to Anthropic API")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        if let Ok(err) = response.json::<ApiError>().await {
+            bail!("API error ({}): {}", status, err.error.message);
+        }
+        bail!("API error: {}", status);
+    }
+
+    let result: CountTokensResponse = response.json().await.context("parsing API response")?;
+    Ok(result.input_tokens)
+}
+
+async fn run_count(args: CountArgs) -> Result<()> {
+    if args.files.is_empty() {
+        bail!("No files specified. Usage: ctc <files...>\n\nRun `ctc --help` for more info.");
+    }
+
+    let api_key = load_api_key()?;
+    let model = args.model.unwrap_or_else(load_default_model);
+    let client = reqwest::Client::new();
+    let mut results: Vec<FileResult> = Vec::new();
+    let mut has_error = false;
+
+    for path in &args.files {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        match count_tokens(&client, &api_key, &model, args.system.as_deref(), path).await {
+            Ok(tokens) => {
+                results.push(FileResult {
+                    file: filename,
+                    tokens,
+                });
+            }
+            Err(e) => {
+                eprintln!("{filename}: error - {e}");
+                has_error = true;
+            }
+        }
+    }
+
+    let total: u64 = results.iter().map(|r| r.tokens).sum();
+
+    match args.output {
+        OutputFormat::Text => {
+            for r in &results {
+                println!("{}: {} tokens", r.file, r.tokens);
+            }
+            if results.len() > 1 {
+                println!("\nTotal: {total} tokens");
+            }
+        }
+        OutputFormat::Json => {
+            let output = JsonOutput {
+                model: model.clone(),
+                files: results,
+                total_tokens: total,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        OutputFormat::Csv => {
+            println!("file,tokens");
+            for r in &results {
+                println!("{},{}", r.file, r.tokens);
+            }
+            if results.len() > 1 {
+                println!("total,{total}");
+            }
+        }
+    }
+
+    if has_error {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Init) => run_init(),
+        Some(Commands::Model) => run_model().await,
+        None => run_count(cli.count).await,
+    }
+}
