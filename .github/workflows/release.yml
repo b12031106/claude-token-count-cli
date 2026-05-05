@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64 Linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: tar czf ctc-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release ctc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ctc-${{ matrix.target }}
+          path: ctc-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ctc-*.tar.gz
+          generate_release_notes: true
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref, '-') }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          SHA_AARCH64_MACOS=$(sha256sum ctc-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_X86_64_MACOS=$(sha256sum ctc-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_X86_64_LINUX=$(sha256sum ctc-x86_64-unknown-linux-musl.tar.gz | cut -d' ' -f1)
+          SHA_AARCH64_LINUX=$(sha256sum ctc-aarch64-unknown-linux-musl.tar.gz | cut -d' ' -f1)
+
+          BASE_URL="https://github.com/b12031106/claude-token-count-cli/releases/download/v${VERSION}"
+
+          cat > ctc.rb <<FORMULA
+          class Ctc < Formula
+            desc "CLI tool to count tokens using Claude's Token Counting API"
+            homepage "https://github.com/b12031106/claude-token-count-cli"
+            version "${VERSION}"
+            license "ISC"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/ctc-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_AARCH64_MACOS}"
+              else
+                url "${BASE_URL}/ctc-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_64_MACOS}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/ctc-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_AARCH64_LINUX}"
+              else
+                url "${BASE_URL}/ctc-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_X86_64_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "ctc"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/ctc --version")
+            end
+          end
+          FORMULA
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' ctc.rb
+
+          gh repo clone b12031106/homebrew-tap tap
+          mkdir -p tap/Formula
+          cp ctc.rb tap/Formula/ctc.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ctc.rb
+          git commit -m "Update ctc to ${VERSION}"
+          git push

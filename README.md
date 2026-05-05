@@ -12,17 +12,33 @@ A fast CLI tool to count tokens in files using Claude's [Token Counting API](htt
 
 ## Install
 
-Requires [Rust toolchain](https://rustup.rs/).
+### Homebrew (macOS / Linux)
 
 ```bash
-git clone <repo-url>
-cd claude-token-count-cli
-cargo build --release
+brew install b12031106/tap/ctc
 ```
 
-The binary will be at `./target/release/ctc`. Copy it to your `$PATH`:
+### Download prebuilt binary
+
+Download the latest binary from [GitHub Releases](https://github.com/b12031106/claude-token-count-cli/releases), then:
 
 ```bash
+tar xzf ctc-*.tar.gz
+mv ctc ~/.local/bin/   # or anywhere in your $PATH
+```
+
+### Cargo (from source)
+
+```bash
+cargo install --git https://github.com/b12031106/claude-token-count-cli.git
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/b12031106/claude-token-count-cli.git
+cd claude-token-count-cli
+cargo build --release
 cp target/release/ctc ~/.local/bin/
 ```
 
