@@ -131,7 +131,7 @@ jobs:
           # Remove leading spaces from heredoc
           sed -i 's/^          //' ctc.rb
 
-          gh repo clone b12031106/homebrew-tap tap
+          git clone https://x-access-token:${GH_TOKEN}@github.com/b12031106/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp ctc.rb tap/Formula/ctc.rb
           cd tap
