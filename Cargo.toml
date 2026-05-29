@@ -1,6 +1,6 @@
 [package]
 name = "ctc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "CLI tool to count tokens using Claude's Token Counting API"
 
