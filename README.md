@@ -68,6 +68,34 @@ ctc <COMMAND>
 |---------|-------------|
 | `ctc init` | Interactive setup — saves API key to `~/.config/ctc/api_key` |
 | `ctc model` | List available models from API and set the default |
+| `ctc compare [FILES]...` | Compare token counts of the same content across multiple models |
+
+#### `ctc compare`
+
+Counts the same content under several models side by side — handy for seeing how
+tokenization differs between model families (e.g. Opus vs Sonnet/Haiku).
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-m, --models <A,B,C>` | Comma-separated models to compare | latest of each tier (opus / sonnet / haiku), fetched from the API |
+| `-s, --system <SYSTEM>` | Include a system prompt in the count | — |
+| `-o, --output <FORMAT>` | Output format: `text`, `json`, `csv` | `text` |
+
+```bash
+# Compare the latest opus / sonnet / haiku automatically
+ctc compare report.pdf
+
+# Compare specific models across several files
+ctc compare -m claude-opus-4-8,claude-sonnet-4-6 a.txt b.txt
+```
+
+```
+File           claude-opus-4-8  claude-sonnet-4-6  claude-haiku-4-5
+a.txt                      105                 75                75
+b.txt                       17                 16                16
+───────────────────────────────────────────────────────────────
+TOTAL                      122                 91                91
+```
 
 ### Options
 

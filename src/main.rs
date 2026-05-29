@@ -281,12 +281,32 @@ struct JsonOutput {
     total_tokens: u64,
 }
 
+#[derive(Args)]
+struct CompareArgs {
+    /// File paths to count tokens for
+    files: Vec<PathBuf>,
+
+    /// Models to compare, comma-separated (default: latest of each tier)
+    #[arg(short, long, value_delimiter = ',')]
+    models: Option<Vec<String>>,
+
+    /// System prompt to include in token count
+    #[arg(short, long)]
+    system: Option<String>,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Set up your Anthropic API key
     Init,
     /// List available models and set the default
     Model,
+    /// Compare token counts of the same content across multiple models
+    Compare(CompareArgs),
 }
 
 // --- API types ---
@@ -305,14 +325,14 @@ struct Message {
     content: Content,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(untagged)]
 enum Content {
     Text(String),
     Blocks(Vec<ContentBlock>),
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
@@ -323,7 +343,7 @@ enum ContentBlock {
     Document { source: DocumentSource },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ImageSource {
     #[serde(rename = "type")]
     source_type: String,
@@ -331,7 +351,7 @@ struct ImageSource {
     data: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DocumentSource {
     #[serde(rename = "type")]
     source_type: String,
@@ -367,6 +387,8 @@ struct ModelInfo {
     id: String,
     display_name: String,
     max_input_tokens: u64,
+    #[serde(default)]
+    created_at: String,
 }
 
 // --- File handling ---
@@ -439,7 +461,16 @@ async fn count_tokens(
     path: &Path,
 ) -> Result<u64> {
     let content = build_content(path)?;
+    count_tokens_for_content(client, api_key, model, system, content).await
+}
 
+async fn count_tokens_for_content(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    system: Option<&str>,
+    content: Content,
+) -> Result<u64> {
     let request = CountTokensRequest {
         model: model.to_string(),
         messages: vec![Message {
@@ -539,6 +570,233 @@ async fn run_count(args: CountArgs) -> Result<()> {
     Ok(())
 }
 
+/// Pick the newest model of each tier (opus, sonnet, haiku) from the fetched list.
+fn pick_default_models(models: &[ModelInfo]) -> Vec<String> {
+    let mut sorted: Vec<&ModelInfo> = models.iter().collect();
+    // created_at is RFC3339 — lexicographic sort gives newest first.
+    // On a tie, prefer the shorter id so the clean alias (e.g. claude-haiku-4-5)
+    // wins over a dated snapshot (claude-haiku-4-5-20251001).
+    sorted.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then(a.id.len().cmp(&b.id.len()))
+    });
+
+    let mut picked = Vec::new();
+    for tier in ["opus", "sonnet", "haiku"] {
+        if let Some(m) = sorted.iter().find(|m| m.id.contains(tier)) {
+            picked.push(m.id.clone());
+        }
+    }
+
+    // Fallback: if no tier matched, take the newest few models as-is.
+    if picked.is_empty() {
+        picked = sorted.iter().take(3).map(|m| m.id.clone()).collect();
+    }
+
+    picked
+}
+
+/// Result of counting one (file, model) cell.
+enum Cell {
+    Ok(u64),
+    Err,
+}
+
+impl Cell {
+    fn tokens(&self) -> Option<u64> {
+        match self {
+            Cell::Ok(t) => Some(*t),
+            Cell::Err => None,
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Cell::Ok(t) => t.to_string(),
+            Cell::Err => "error".to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CompareFileJson {
+    file: String,
+    /// Token counts parallel to the `models` list; null where counting failed.
+    tokens: Vec<Option<u64>>,
+}
+
+#[derive(Serialize)]
+struct CompareJsonOutput {
+    models: Vec<String>,
+    files: Vec<CompareFileJson>,
+    /// Per-model totals across all files (failed cells excluded).
+    totals: Vec<u64>,
+}
+
+async fn run_compare(args: CompareArgs) -> Result<()> {
+    if args.files.is_empty() {
+        bail!("No files specified. Usage: ctc compare <files...>\n\nRun `ctc compare --help` for more info.");
+    }
+
+    let api_key = load_api_key()?;
+    let client = reqwest::Client::new();
+
+    let models: Vec<String> = match args.models {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            eprintln!("Fetching models to pick the latest of each tier...");
+            let fetched = fetch_models(&client, &api_key).await?;
+            let picked = pick_default_models(&fetched);
+            if picked.is_empty() {
+                bail!("Could not determine default models. Specify them with -m model1,model2.");
+            }
+            picked
+        }
+    };
+
+    // filename -> one Cell per model (parallel to `models`).
+    let mut rows: Vec<(String, Vec<Cell>)> = Vec::new();
+    let mut has_error = false;
+
+    for path in &args.files {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        let content = match build_content(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{filename}: error - {e}");
+                has_error = true;
+                rows.push((filename, models.iter().map(|_| Cell::Err).collect()));
+                continue;
+            }
+        };
+
+        let mut cells = Vec::with_capacity(models.len());
+        for model in &models {
+            match count_tokens_for_content(
+                &client,
+                &api_key,
+                model,
+                args.system.as_deref(),
+                content.clone(),
+            )
+            .await
+            {
+                Ok(tokens) => cells.push(Cell::Ok(tokens)),
+                Err(e) => {
+                    eprintln!("{filename} @ {model}: error - {e}");
+                    has_error = true;
+                    cells.push(Cell::Err);
+                }
+            }
+        }
+        rows.push((filename, cells));
+    }
+
+    // Per-model totals across files (failed cells excluded).
+    let totals: Vec<u64> = (0..models.len())
+        .map(|i| rows.iter().filter_map(|(_, c)| c[i].tokens()).sum())
+        .collect();
+
+    match args.output {
+        OutputFormat::Text => print_compare_text(&models, &rows, &totals),
+        OutputFormat::Json => {
+            let output = CompareJsonOutput {
+                models: models.clone(),
+                files: rows
+                    .iter()
+                    .map(|(file, cells)| CompareFileJson {
+                        file: file.clone(),
+                        tokens: cells.iter().map(|c| c.tokens()).collect(),
+                    })
+                    .collect(),
+                totals,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        OutputFormat::Csv => {
+            println!("file,{}", models.join(","));
+            for (file, cells) in &rows {
+                let vals: Vec<String> = cells.iter().map(|c| c.display()).collect();
+                println!("{file},{}", vals.join(","));
+            }
+            if rows.len() > 1 {
+                let vals: Vec<String> = totals.iter().map(|t| t.to_string()).collect();
+                println!("total,{}", vals.join(","));
+            }
+        }
+    }
+
+    if has_error {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn print_compare_text(models: &[String], rows: &[(String, Vec<Cell>)], totals: &[u64]) {
+    let show_total = rows.len() > 1;
+
+    // Column widths: first column for filenames, one per model.
+    let name_w = rows
+        .iter()
+        .map(|(f, _)| f.len())
+        .chain(std::iter::once("File".len()))
+        .chain(if show_total {
+            Some("TOTAL".len())
+        } else {
+            None
+        })
+        .max()
+        .unwrap_or(4);
+
+    let col_w: Vec<usize> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let cells_max = rows.iter().map(|(_, c)| c[i].display().len()).max().unwrap_or(0);
+            let total_len = if show_total {
+                totals[i].to_string().len()
+            } else {
+                0
+            };
+            m.len().max(cells_max).max(total_len)
+        })
+        .collect();
+
+    // Header.
+    print!("{:<name_w$}", "File");
+    for (i, m) in models.iter().enumerate() {
+        print!("  {:>w$}", m, w = col_w[i]);
+    }
+    println!();
+
+    // File rows.
+    for (file, cells) in rows {
+        print!("{:<name_w$}", file);
+        for (i, cell) in cells.iter().enumerate() {
+            print!("  {:>w$}", cell.display(), w = col_w[i]);
+        }
+        println!();
+    }
+
+    // Total row.
+    if show_total {
+        let total_line_w = name_w + col_w.iter().map(|w| w + 2).sum::<usize>();
+        println!("{}", "─".repeat(total_line_w));
+        print!("{:<name_w$}", "TOTAL");
+        for (i, t) in totals.iter().enumerate() {
+            print!("  {:>w$}", t, w = col_w[i]);
+        }
+        println!();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -546,6 +804,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Init) => run_init(),
         Some(Commands::Model) => run_model().await,
+        Some(Commands::Compare(args)) => run_compare(args).await,
         None => run_count(cli.count).await,
     }
 }
