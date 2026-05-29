@@ -25,7 +25,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,7 +50,7 @@ jobs:
       - name: Package
         run: tar czf ctc-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release ctc
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ctc-${{ matrix.target }}
           path: ctc-${{ matrix.target }}.tar.gz
@@ -59,12 +59,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ctc-*.tar.gz
           generate_release_notes: true
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref, '-') }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
